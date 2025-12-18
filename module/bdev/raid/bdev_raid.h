@@ -150,6 +150,8 @@ struct raid_bdev_io {
 	/* Private data for the raid module */
 	void				*module_private;
 
+	TAILQ_ENTRY(raid_bdev_io) tw_link;
+
 	/* Custom completion callback. Overrides bdev_io completion if set. */
 	raid_bdev_io_completion_cb	completion_cb;
 
@@ -276,6 +278,20 @@ const char *raid_bdev_state_to_str(enum raid_bdev_state state);
 const char *raid_bdev_process_to_str(enum raid_process_type value);
 void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
 int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx);
+
+#define RAID_TW_NUM_BKTS 1024
+
+struct raid_bdev_tw_bucket {
+    TAILQ_HEAD(, raid_bdev_io) requests;
+};
+
+struct raid_bdev_timewheel {
+    uint64_t res_tsc;
+    uint64_t cur_tsc;
+	uint32_t cur_idx;
+    uint32_t num_bkts;
+    struct raid_bdev_tw_bucket buckets[0];
+};
 
 /*
  * RAID module descriptor

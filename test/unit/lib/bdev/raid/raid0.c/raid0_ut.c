@@ -103,6 +103,14 @@ set_test_opts_dif(void)
 	return 0;
 }
 
+/* Add this near the other mock functions in raid0_ut.c */
+void
+raid_bdev_module_stop_done(struct raid_bdev *raid_bdev)
+{
+    /* This can be empty, or you can use a counter to verify 
+     * it was called during tests. */
+}
+
 /* Set globals before every test run */
 static void
 set_globals(void)

@@ -13,6 +13,27 @@
 
 #include "spdk/log.h"
 
+struct raid0_info {
+	/* The parent raid bdev */
+	struct raid_bdev *raid_bdev;
+
+	/* base delay b/w two i/o chunks for this raid device */
+	uint64_t delay_tsc;
+};
+
+struct raid0_io_channel {
+	/* Array of per-base_bdev counters of outstanding read blocks on this channel */
+	struct raid_bdev_timewheel time_wheel;
+};
+
+/* Prototypes */
+static size_t
+raid_bdev_timewheel_init(struct raid_bdev_timewheel *tw, uint64_t res_tsc, uint64_t num_bkts);
+static void
+raid_bdev_timewheel_add_request(struct raid_bdev_timewheel *tw, struct raid_bdev_io *raid_io, uint64_t delay_idx);
+static int
+raid_bdev_run_timewheel(void *arg);
+
 /*
  * brief:
  * raid0_bdev_io_completion function is called by lower layers to notify raid
@@ -159,6 +180,47 @@ raid0_submit_rw_request(struct raid_bdev_io *raid_io)
 		assert(false);
 		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
+}
+
+/*
+* submission entry point into the raid0 module
+* this is only to support the delay functionality, it only calculates the delay and queues the 
+* request to be submitted later
+*/
+static void
+raid0_queue_rw_request(struct raid_bdev_io *raid_io)
+{
+	struct raid_bdev_io_channel	*raid_ch = raid_io->raid_ch;
+	struct raid_bdev		*raid_bdev = raid_io->raid_bdev;
+	uint8_t				pd_idx;
+	uint64_t			start_strip;
+	uint64_t			end_strip;
+	struct raid0_io_channel		*raid0_ch;
+	struct raid0_info 			*r0info;
+	uint64_t delay_tsc;
+
+	start_strip = raid_io->offset_blocks >> raid_bdev->strip_size_shift;
+	end_strip = (raid_io->offset_blocks + raid_io->num_blocks - 1) >>
+		    raid_bdev->strip_size_shift;
+	if (start_strip != end_strip && raid_bdev->num_base_bdevs > 1) {
+		assert(false);
+		SPDK_ERRLOG("I/O spans strip boundary!\n");
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	pd_idx = start_strip % raid_bdev->num_base_bdevs;
+
+	raid0_ch = raid_bdev_channel_get_module_ctx(raid_ch);
+	
+	r0info = raid_bdev->module_private;
+
+	delay_tsc = pd_idx * r0info->delay_tsc;
+	
+	if (delay_tsc == 0)
+		raid0_submit_rw_request(raid_io);
+	else
+		raid_bdev_timewheel_add_request(&raid0_ch->time_wheel, raid_io, delay_tsc);
 }
 
 /* raid0 IO range */
@@ -359,12 +421,75 @@ raid0_submit_null_payload_request(struct raid_bdev_io *raid_io)
 	}
 }
 
+static void
+raid0_ioch_destroy(void *io_device, void *ctx_buf)
+{
+}
+
+static inline uint64_t 
+_us_to_ticks(uint64_t us) {
+    return us * spdk_get_ticks_hz() / 1000000ULL;
+}
+
+static uint64_t
+_get_delay_tsc_from_env(void)
+{
+	uint64_t delay_tsc;
+	uint64_t delay_us;
+	char *dstr = getenv("RAID_DELAY_US");
+
+	if (!dstr)
+		return 0;
+	
+	delay_us = strtoull(dstr, NULL, 10);
+	
+	delay_tsc = _us_to_ticks(delay_us);
+	
+	return delay_tsc;
+}
+
+static int
+raid0_ioch_create(void *io_device, void *ctx_buf)
+{
+	struct raid0_io_channel *raid0_ch = ctx_buf;
+	struct raid0_info *r0info = io_device;
+
+	uint64_t dtsc = _get_delay_tsc_from_env();
+	r0info->delay_tsc = dtsc;
+
+	raid_bdev_timewheel_init(&raid0_ch->time_wheel, dtsc, RAID_TW_NUM_BKTS);
+
+	SPDK_POLLER_REGISTER(raid_bdev_run_timewheel, raid0_ch, 0);
+
+	return 0;
+}
+
+static void
+raid0_io_device_unregister_done(void *io_device)
+{
+	struct raid0_info *r0info = io_device;
+
+	raid_bdev_module_stop_done(r0info->raid_bdev);
+
+	free(r0info);
+}
+
 static int
 raid0_start(struct raid_bdev *raid_bdev)
 {
 	uint64_t min_blockcnt = UINT64_MAX;
 	uint64_t base_bdev_data_size;
 	struct raid_base_bdev_info *base_info;
+
+	struct raid0_info *r0info;
+	char name[256];
+
+	r0info = calloc(1, sizeof(*r0info));
+	if (!r0info) {
+		SPDK_ERRLOG("Failed to allocate RAID0 info device structure\n");
+		return -ENOMEM;
+	}
+	r0info->raid_bdev = raid_bdev;
 
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		/* Calculate minimum block count from all base bdevs */
@@ -396,7 +521,31 @@ raid0_start(struct raid_bdev *raid_bdev)
 		raid_bdev->bdev.split_on_optimal_io_boundary = false;
 	}
 
+	raid_bdev->module_private = r0info;
+	snprintf(name, sizeof(name), "raid0_%s", raid_bdev->bdev.name);
+	spdk_io_device_register(r0info, raid0_ioch_create, raid0_ioch_destroy,
+				sizeof(struct raid0_io_channel) + RAID_TW_NUM_BKTS * sizeof(struct raid_bdev_tw_bucket),
+				name);
+
 	return 0;
+}
+
+static bool
+raid0_stop(struct raid_bdev *raid_bdev)
+{
+	struct raid0_info *r0info = raid_bdev->module_private;
+
+	spdk_io_device_unregister(r0info, raid0_io_device_unregister_done);
+
+	return false;
+}
+
+static struct spdk_io_channel *
+raid0_get_io_channel(struct raid_bdev *raid_bdev)
+{
+	struct raid0_info *r0info = raid_bdev->module_private;
+
+	return spdk_get_io_channel(r0info);
 }
 
 static bool
@@ -434,13 +583,87 @@ raid0_resize(struct raid_bdev *raid_bdev)
 	return true;
 }
 
+/* ---------- Timewheel handler functions - later may need to add a separate C file ----------- */
+/*
+* Initialize a timewheel and return the *TOTAL* size of the struct in bytes
+*/
+static size_t
+raid_bdev_timewheel_init(struct raid_bdev_timewheel *tw, uint64_t res_tsc, uint64_t num_bkts) {
+    tw->res_tsc = res_tsc;
+    tw->num_bkts = num_bkts;
+	tw->cur_tsc = spdk_get_ticks();
+	tw->cur_idx = 0;
+	
+    for (uint64_t i = 0; i < num_bkts; i++) {
+        TAILQ_INIT(&tw->buckets[i].requests);
+    }
+
+	return sizeof(*tw) + num_bkts * sizeof(*tw->buckets);
+}
+
+static size_t
+raid_bdev_timewheel_process_tick(struct raid_bdev_timewheel *tw) {
+    struct raid_bdev_io *raid_io;
+	struct raid_bdev_tw_bucket *bucket;
+	bucket = &tw->buckets[tw->cur_idx];
+	size_t n = 0;
+	
+	while (!TAILQ_EMPTY(&bucket->requests)) {
+		raid_io = TAILQ_FIRST(&bucket->requests);
+		TAILQ_REMOVE(&bucket->requests, raid_io, tw_link);
+		
+		raid0_submit_rw_request(raid_io);
+		n++;
+	}
+
+	return n;
+}
+
+static size_t
+raid_bdev_timewheel_process_ticks(struct raid_bdev_timewheel *tw, uint64_t end_tsc) {
+	size_t n = 0;
+	while (tw->cur_tsc < end_tsc) {
+		n += raid_bdev_timewheel_process_tick(tw);
+		tw->cur_tsc += tw->res_tsc;
+		tw->cur_idx++;
+		if (tw->cur_idx >= tw->num_bkts)
+			tw->cur_idx = 0;
+	}
+
+	return n;
+}
+
+static void
+raid_bdev_timewheel_add_request(struct raid_bdev_timewheel *tw, struct raid_bdev_io *raid_io, uint64_t delay_idx) {
+    uint64_t tsc = tw->cur_tsc;
+    uint64_t idx = tsc / tw->res_tsc % tw->num_bkts;
+    TAILQ_INSERT_TAIL(&tw->buckets[idx].requests, raid_io, tw_link);
+}
+
+static int
+raid_bdev_run_timewheel(void *arg) {
+	struct raid0_io_channel *raid0_ch = arg;
+	
+	size_t nreq = 0;
+	uint64_t now_tsc = spdk_get_ticks();
+
+	if (now_tsc >= raid0_ch->time_wheel.cur_tsc) {
+		nreq = raid_bdev_timewheel_process_ticks(&raid0_ch->time_wheel, now_tsc);
+	}
+
+	return nreq ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+
 static struct raid_bdev_module g_raid0_module = {
 	.level = RAID0,
 	.base_bdevs_min = 1,
 	.memory_domains_supported = true,
 	.dif_supported = true,
 	.start = raid0_start,
-	.submit_rw_request = raid0_submit_rw_request,
+	.stop = raid0_stop,
+	.get_io_channel = raid0_get_io_channel,
+	.submit_rw_request = raid0_queue_rw_request,
 	.submit_null_payload_request = raid0_submit_null_payload_request,
 	.resize = raid0_resize,
 };
