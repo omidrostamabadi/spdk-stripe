@@ -457,9 +457,11 @@ raid0_ioch_create(void *io_device, void *ctx_buf)
 	uint64_t dtsc = _get_delay_tsc_from_env();
 	r0info->delay_tsc = dtsc;
 
-	raid_bdev_timewheel_init(&raid0_ch->time_wheel, dtsc, RAID_TW_NUM_BKTS);
+	if (dtsc != 0) {
+		raid_bdev_timewheel_init(&raid0_ch->time_wheel, dtsc, RAID_TW_NUM_BKTS);
 
-	SPDK_POLLER_REGISTER(raid_bdev_run_timewheel, raid0_ch, 0);
+		SPDK_POLLER_REGISTER(raid_bdev_run_timewheel, raid0_ch, 0);
+	}
 
 	return 0;
 }
@@ -526,7 +528,8 @@ raid0_start(struct raid_bdev *raid_bdev)
 	spdk_io_device_register(r0info, raid0_ioch_create, raid0_ioch_destroy,
 				sizeof(struct raid0_io_channel) + RAID_TW_NUM_BKTS * sizeof(struct raid_bdev_tw_bucket),
 				name);
-
+	
+	SPDK_NOTICELOG("register i/o device named %s\n", name);
 	return 0;
 }
 
@@ -592,7 +595,7 @@ raid_bdev_timewheel_init(struct raid_bdev_timewheel *tw, uint64_t res_tsc, uint6
     tw->res_tsc = res_tsc;
     tw->num_bkts = num_bkts;
 	tw->cur_tsc = spdk_get_ticks();
-	tw->cur_idx = 0;
+	tw->cur_idx = tw->cur_tsc / res_tsc % num_bkts;
 	
     for (uint64_t i = 0; i < num_bkts; i++) {
         TAILQ_INIT(&tw->buckets[i].requests);
@@ -634,8 +637,8 @@ raid_bdev_timewheel_process_ticks(struct raid_bdev_timewheel *tw, uint64_t end_t
 }
 
 static void
-raid_bdev_timewheel_add_request(struct raid_bdev_timewheel *tw, struct raid_bdev_io *raid_io, uint64_t delay_idx) {
-    uint64_t tsc = tw->cur_tsc;
+raid_bdev_timewheel_add_request(struct raid_bdev_timewheel *tw, struct raid_bdev_io *raid_io, uint64_t delay_tsc) {
+    uint64_t tsc = spdk_get_ticks() + delay_tsc;
     uint64_t idx = tsc / tw->res_tsc % tw->num_bkts;
     TAILQ_INSERT_TAIL(&tw->buckets[idx].requests, raid_io, tw_link);
 }
