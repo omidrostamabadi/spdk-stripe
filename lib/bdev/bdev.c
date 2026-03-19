@@ -120,10 +120,16 @@ static struct spdk_bdev_mgr g_bdev_mgr = {
 	.async_bdev_opens = TAILQ_HEAD_INITIALIZER(g_bdev_mgr.async_bdev_opens),
 };
 
+static bool g_bdev_local_trace_enabled = false;
+
 static void
 __attribute__((constructor))
 _bdev_init(void)
 {
+	if (getenv("ENABLE_BDEV_TRACE") != NULL) {
+		SPDK_ERRLOG("bdev tracing enabled\n");
+		g_bdev_local_trace_enabled = true;
+	}
 	spdk_spin_init(&g_bdev_mgr.spinlock);
 }
 
@@ -157,6 +163,229 @@ static void			*g_init_cb_arg = NULL;
 static spdk_bdev_fini_cb	g_fini_cb_fn = NULL;
 static void			*g_fini_cb_arg = NULL;
 static struct spdk_thread	*g_fini_thread = NULL;
+
+
+
+
+
+
+
+/* ---- local bdev trace: additive, env-var controlled ---- */
+
+#define BDEV_LOCAL_TRACE_MAX_LCORES 128
+#define BDEV_LOCAL_TRACE_CAP        (1u << 20)
+#define BDEV_LOCAL_TRACE_MAGIC      UINT64_C(0x4254445654524143) /* "BTDVTRAC" */
+#define BDEV_LOCAL_TRACE_VERSION    1
+
+enum bdev_local_trace_type {
+	BDEV_LOCAL_TRACE_TYPE_INVALID = 0,
+	BDEV_LOCAL_TRACE_TYPE_SLACK   = 1,
+};
+
+union bdev_local_trace_args {
+	struct {
+		uint64_t slack_tsc;
+	} slack;
+};
+
+struct __attribute__((packed)) bdev_local_trace_superblock {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t superblock_bytes;
+	uint32_t record_bytes;
+	uint32_t reserved0;
+	uint64_t tick_hz;
+	uint64_t num_valid_records;
+	uint64_t walltime_sec;
+	uint32_t walltime_nsec;
+	uint32_t reserved1;
+};
+
+struct __attribute__((packed)) bdev_local_trace_rec {
+	uint64_t tsc;
+	uint64_t id;
+	uint8_t  is_new_obj;
+	uint8_t  type;
+	uint16_t rsvd16;
+	uint32_t rsvd32;
+	union bdev_local_trace_args args;
+};
+
+struct bdev_local_trace_lcore {
+	struct bdev_local_trace_superblock *sb;
+	struct bdev_local_trace_rec *recs;
+	uint32_t cap;
+	uint32_t next;
+	size_t map_bytes;
+	int fd;
+};
+
+static struct bdev_local_trace_lcore g_bdev_local_trace[BDEV_LOCAL_TRACE_MAX_LCORES];
+
+static inline size_t
+bdev_local_trace_map_bytes(void)
+{
+	return sizeof(struct bdev_local_trace_superblock) +
+	       sizeof(struct bdev_local_trace_rec) * (size_t)BDEV_LOCAL_TRACE_CAP;
+}
+
+static int
+bdev_local_trace_init_lcore(uint32_t lcore)
+{
+	struct bdev_local_trace_lcore *lt;
+	struct bdev_local_trace_superblock *sb;
+	struct timespec ts;
+	char path[128];
+	size_t bytes;
+	void *addr;
+	int fd, rc;
+
+	if (lcore >= BDEV_LOCAL_TRACE_MAX_LCORES) {
+		return -EINVAL;
+	}
+
+	lt = &g_bdev_local_trace[lcore];
+	if (lt->recs != NULL) {
+		return 0;
+	}
+
+	snprintf(path, sizeof(path), "/tmp/spdk_bdev_trace.lcore%u.bin",
+		 lcore);
+
+	fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+	if (fd < 0) {
+		return -errno;
+	}
+
+	bytes = bdev_local_trace_map_bytes();
+	rc = ftruncate(fd, (off_t)bytes);
+	if (rc != 0) {
+		rc = -errno;
+		close(fd);
+		return rc;
+	}
+
+	addr = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (addr == MAP_FAILED) {
+		rc = -errno;
+		close(fd);
+		return rc;
+	}
+
+	memset(addr, 0, bytes);
+
+	sb = (struct bdev_local_trace_superblock *)addr;
+	sb->magic = BDEV_LOCAL_TRACE_MAGIC;
+	sb->version = BDEV_LOCAL_TRACE_VERSION;
+	sb->superblock_bytes = sizeof(*sb);
+	sb->record_bytes = sizeof(struct bdev_local_trace_rec);
+	sb->tick_hz = spdk_get_ticks_hz();
+
+	rc = clock_gettime(CLOCK_REALTIME, &ts);
+	if (rc == 0) {
+		sb->walltime_sec = (uint64_t)ts.tv_sec;
+		sb->walltime_nsec = (uint32_t)ts.tv_nsec;
+	}
+
+	lt->sb = sb;
+	lt->recs = (struct bdev_local_trace_rec *)((char *)addr + sizeof(*sb));
+	lt->cap = BDEV_LOCAL_TRACE_CAP;
+	lt->next = 0;
+	lt->map_bytes = bytes;
+	lt->fd = fd;
+	return 0;
+}
+
+static inline struct bdev_local_trace_lcore *
+bdev_local_trace_get_current(void)
+{
+	struct spdk_thread *thread;
+	uint64_t tid;
+
+	if (spdk_unlikely(!g_bdev_local_trace_enabled)) {
+		return NULL;
+	}
+
+	thread = spdk_get_thread();
+	if (spdk_unlikely(thread == NULL)) {
+		SPDK_ERRLOG("No current SPDK thread\n");
+		return NULL;
+	}
+
+	tid = spdk_thread_get_id(thread);
+	if (spdk_unlikely(tid >= BDEV_LOCAL_TRACE_MAX_LCORES)) {
+		SPDK_ERRLOG("SPDK thread id %" PRIu64 " exceeds max slots %u\n",
+			    tid, BDEV_LOCAL_TRACE_MAX_LCORES);
+		return NULL;
+	}
+
+	if (spdk_unlikely(g_bdev_local_trace[tid].recs == NULL)) {
+		if (bdev_local_trace_init_lcore((uint32_t)tid) != 0) {
+			SPDK_ERRLOG("Failed to init on SPDK thread id %" PRIu64 "\n", tid);
+			return NULL;
+		}
+
+		SPDK_ERRLOG("Success to init on SPDK thread id %" PRIu64 "\n", tid);
+	}
+
+	return &g_bdev_local_trace[tid];
+}
+
+static inline void
+bdev_local_trace_record_tsc(uint64_t tsc, uint64_t id, bool is_new_obj,
+			    enum bdev_local_trace_type type,
+			    const union bdev_local_trace_args *args)
+{
+	struct bdev_local_trace_lcore *lt;
+	struct bdev_local_trace_rec *rec;
+	uint32_t idx;
+
+	lt = bdev_local_trace_get_current();
+	if (spdk_unlikely(lt == NULL)) {
+		SPDK_ERRLOG("curr was NULL\n");
+		return;
+	}
+
+	idx = lt->next++ % lt->cap;
+	rec = &lt->recs[idx];
+
+	if (lt->sb != NULL) {
+		if (lt->next <= lt->cap) {
+			lt->sb->num_valid_records = lt->next;
+		} else {
+			lt->sb->num_valid_records = lt->cap;
+		}
+	}
+
+	rec->tsc = tsc;
+	rec->id = id;
+	rec->is_new_obj = is_new_obj ? 1 : 0;
+	rec->type = (uint8_t)type;
+	rec->rsvd16 = 0;
+	rec->rsvd32 = 0;
+
+	if (args != NULL) {
+		rec->args = *args;
+	} else {
+		memset(&rec->args, 0, sizeof(rec->args));
+	}
+}
+
+static inline void
+bdev_local_trace_record(uint64_t id, bool is_new_obj,
+			enum bdev_local_trace_type type,
+			const union bdev_local_trace_args *args)
+{
+	bdev_local_trace_record_tsc(spdk_get_ticks(), id, is_new_obj, type, args);
+}
+
+/* ---- end local bdev trace ---- */
+
+
+
+
+
+
 
 struct spdk_bdev_qos_limit {
 	/** IOs or bytes allowed per second (i.e., 1s). */
@@ -3575,6 +3804,11 @@ bdev_io_split_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		parent_io->internal.split.current_offset_blocks += parent_io->internal.split.remaining_num_blocks;
 		parent_io->internal.split.remaining_num_blocks = 0;
 	}
+
+	if (parent_io->internal.split.first_child_tsc == 0) {
+		parent_io->internal.split.first_child_tsc = spdk_get_ticks();
+	}
+
 	parent_io->internal.split.outstanding--;
 	if (parent_io->internal.split.outstanding != 0) {
 		return;
@@ -3586,6 +3820,15 @@ bdev_io_split_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (parent_io->internal.split.remaining_num_blocks == 0) {
 		assert(parent_io->internal.cb != bdev_io_split_done);
 		bdev_ch_remove_from_io_submitted(parent_io);
+
+		uint64_t now = spdk_get_ticks();
+		union bdev_local_trace_args trace_args = {};
+
+		trace_args.slack.slack_tsc = now - parent_io->internal.split.first_child_tsc;
+		bdev_local_trace_record_tsc(now, (uint64_t)(uintptr_t)parent_io, true,
+						BDEV_LOCAL_TRACE_TYPE_SLACK, &trace_args);
+
+
 		spdk_trace_record(TRACE_BDEV_IO_DONE, parent_io->internal.ch->trace_id,
 				  0, (uintptr_t)parent_io, bdev_io->internal.caller_ctx,
 				  parent_io->internal.ch->queue_depth);
@@ -3642,6 +3885,7 @@ bdev_io_split(struct spdk_bdev_io *bdev_io)
 	bdev_io->internal.split.current_offset_blocks = bdev_io->u.bdev.offset_blocks;
 	bdev_io->internal.split.remaining_num_blocks = bdev_io->u.bdev.num_blocks;
 	bdev_io->internal.split.outstanding = 0;
+	bdev_io->internal.split.first_child_tsc = 0;
 	bdev_io->internal.status = SPDK_BDEV_IO_STATUS_SUCCESS;
 
 	switch (bdev_io->type) {

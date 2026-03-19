@@ -1034,6 +1034,9 @@ struct spdk_bdev_io_internal_fields {
 		/** current offset of the split I/O in the bdev */
 		uint64_t current_offset_blocks;
 
+		/** tsc of first child i/o completion */
+		uint64_t first_child_tsc;
+
 		/** count of outstanding batched split I/Os */
 		uint32_t outstanding;
 	} split;
@@ -1119,7 +1122,7 @@ struct spdk_bdev_io {
 		struct spdk_bdev_io_zone_mgmt_params zone_mgmt;
 	} u;
 
-	uint8_t reserved3[40];
+	uint8_t reserved3[32];
 
 	/**
 	 *  Fields that are used internally by the bdev subsystem.  Bdev modules
