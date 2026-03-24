@@ -29,6 +29,8 @@
 #include "spdk_internal/trace_defs.h"
 #include "spdk_internal/assert.h"
 
+#include <sched.h>
+
 #ifdef SPDK_CONFIG_VTUNE
 #include "ittnotify.h"
 #include "ittnotify_types.h"
@@ -299,36 +301,37 @@ bdev_local_trace_init_lcore(uint32_t lcore)
 static inline struct bdev_local_trace_lcore *
 bdev_local_trace_get_current(void)
 {
-	struct spdk_thread *thread;
-	uint64_t tid;
+    uint32_t core_id;
 
-	if (spdk_unlikely(!g_bdev_local_trace_enabled)) {
-		return NULL;
-	}
+    if (spdk_unlikely(!g_bdev_local_trace_enabled)) {
+        return NULL;
+    }
 
-	thread = spdk_get_thread();
-	if (spdk_unlikely(thread == NULL)) {
-		SPDK_ERRLOG("No current SPDK thread\n");
-		return NULL;
-	}
+    /* Grab the physical/DPDK lcore ID instead of the lightweight SPDK thread ID */
+    core_id = sched_getcpu();
 
-	tid = spdk_thread_get_id(thread);
-	if (spdk_unlikely(tid >= BDEV_LOCAL_TRACE_MAX_LCORES)) {
-		SPDK_ERRLOG("SPDK thread id %" PRIu64 " exceeds max slots %u\n",
-			    tid, BDEV_LOCAL_TRACE_MAX_LCORES);
-		return NULL;
-	}
+    /* Fallback catch: ensure the thread is known to the SPDK environment */
+    if (spdk_unlikely(core_id == SPDK_ENV_LCORE_ID_ANY)) {
+        SPDK_ERRLOG("Current thread is not pinned to a recognized SPDK lcore\n");
+        return NULL;
+    }
 
-	if (spdk_unlikely(g_bdev_local_trace[tid].recs == NULL)) {
-		if (bdev_local_trace_init_lcore((uint32_t)tid) != 0) {
-			SPDK_ERRLOG("Failed to init on SPDK thread id %" PRIu64 "\n", tid);
-			return NULL;
-		}
+    if (spdk_unlikely(core_id >= BDEV_LOCAL_TRACE_MAX_LCORES)) {
+        SPDK_ERRLOG("SPDK core id %u exceeds max slots %u\n",
+                    core_id, BDEV_LOCAL_TRACE_MAX_LCORES);
+        return NULL;
+    }
 
-		SPDK_ERRLOG("Success to init on SPDK thread id %" PRIu64 "\n", tid);
-	}
+    if (spdk_unlikely(g_bdev_local_trace[core_id].recs == NULL)) {
+        if (bdev_local_trace_init_lcore(core_id) != 0) {
+            SPDK_ERRLOG("Failed to init on SPDK core id %u\n", core_id);
+            return NULL;
+        }
 
-	return &g_bdev_local_trace[tid];
+        SPDK_ERRLOG("Success to init on SPDK core id %u\n", core_id);
+    }
+
+    return &g_bdev_local_trace[core_id];
 }
 
 static inline void
